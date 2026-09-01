@@ -7,159 +7,190 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
 
-# --- Page Configuration ---
+# --- Streamlit UI Config ---
 st.set_page_config(
-    page_title="AI Document Assistant",
+    page_title="RAG AI Assistant",
     page_icon="🤖",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.title("🤖 AI Document Assistant (RAG Chat)")
-st.write("Upload your PDFs, enter your OpenAI API Key, and start asking questions!")
+# Custom Styling for polished UI
+st.markdown(
+    """
+    <style>
+    .main-title {
+        font-size: 2.2rem;
+        font-weight: 700;
+        margin-bottom: 0.2rem;
+    }
+    .sub-title {
+        color: #6c757d;
+        margin-bottom: 1.5rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# --- Sidebar Configuration ---
+st.markdown('<div class="main-title">🤖 Document Intelligence Assistant</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">Chat directly with your PDF documents using RAG (Retrieval-Augmented Generation).</div>', unsafe_allow_html=True)
+
+# --- Sidebar UI ---
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("⚙️ Configuration")
     
-    # Try reading key from Streamlit Secrets first; fallback to user text input
+    # Check secrets or ask user
     secret_key = st.secrets.get("OPENAI_API_KEY", "")
     openai_api_key = st.text_input(
         "OpenAI API Key",
         value=secret_key,
         type="password",
-        help="Get your key from https://platform.openai.com/api-keys"
+        placeholder="sk-...",
+        help="Provide your OpenAI API key to run the model."
     )
     
+    st.markdown("---")
+    st.header("📄 Upload Data")
     uploaded_files = st.file_uploader(
-        "Upload PDF Documents",
+        "Upload PDF Files",
         type=["pdf"],
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        help="Upload one or more PDF files to index."
     )
     
-    if st.button("🗑️ Clear Chat History", use_container_width=True):
+    st.markdown("---")
+    if st.button("🗑️ Reset Chat", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
 
-# --- Initialize Session States ---
+# --- Initialize Session State ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 if "rag_chain" not in st.session_state:
     st.session_state.rag_chain = None
 
-if "processed_files" not in st.session_state:
-    st.session_state.processed_files = []
+if "indexed_file_names" not in st.session_state:
+    st.session_state.indexed_file_names = []
 
 
-# --- Helper: Build Vectorstore & RAG Chain ---
-def initialize_rag(files, api_key):
+# --- Helper Functions ---
+def format_docs(docs):
+    """Combines chunk contents into a single string for context."""
+    return "\n\n".join(doc.page_content for doc in docs)
+
+
+def build_rag_pipeline(files, api_key):
+    """Processes uploaded documents and builds the LangChain LCEL pipeline."""
     docs = []
     
-    # Load PDFs using temporary files
+    # Read files temporarily
     for file in files:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(file.read())
-            loader = PyPDFLoader(tmp_file.name)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(file.read())
+            loader = PyPDFLoader(tmp.name)
             docs.extend(loader.load())
-            os.remove(tmp_file.name)
+            os.remove(tmp.name)
 
     if not docs:
         return None
 
-    # 1. Split text into manageable chunks
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200
-    )
-    splits = text_splitter.split_documents(docs)
+    # 1. Text splitting
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+    chunks = splitter.split_documents(docs)
 
-    # 2. Embed and store in in-memory FAISS Vector Store
+    # 2. Vector Store Setup
     embeddings = OpenAIEmbeddings(openai_api_key=api_key)
-    vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
+    vectorstore = FAISS.from_documents(chunks, embeddings)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-    # 3. LLM Setup
+    # 3. Model Setup
     llm = ChatOpenAI(
         model="gpt-4o-mini",
         temperature=0.2,
         openai_api_key=api_key
     )
 
-    # 4. Contextualize query prompt (Memory re-writer)
-    contextualize_q_system_prompt = (
-        "Given a chat history and the latest user question which might reference context "
-        "in the chat history, formulate a standalone question which can be understood "
-        "without the chat history. Do NOT answer the question, just reformulate it if "
-        "needed and otherwise return it as is."
-    )
-    contextualize_q_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", contextualize_q_system_prompt),
-            MessagesPlaceholder("chat_history"),
-            ("human", "{input}"),
-        ]
-    )
-    history_aware_retriever = create_history_aware_retriever(
-        llm, retriever, contextualize_q_prompt
-    )
+    # 4. History-aware rephraser prompt
+    rephrase_prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            "Given a chat history and the latest user question which might reference context "
+            "in the chat history, formulate a standalone question which can be understood "
+            "without the chat history. Do NOT answer the question, just reformulate it if "
+            "needed and otherwise return it as is."
+        ),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{question}"),
+    ])
+    
+    rephrase_chain = rephrase_prompt | llm | StrOutputParser() | retriever | format_docs
 
-    # 5. Question Answering prompt
-    system_prompt = (
-        "You are an assistant for question-answering tasks. "
-        "Use the following retrieved context to answer the question. "
-        "If you do not know the answer, say that you do not know. "
-        "Keep answers clear and factual.\n\n"
-        "Context:\n{context}"
+    # 5. QA Prompt
+    qa_prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            "You are a helpful and precise assistant. Answer the user's question based strictly on the "
+            "provided retrieved context below. If the context doesn't contain the answer, state that "
+            "the document does not provide enough information.\n\n"
+            "Retrieved Context:\n{context}"
+        ),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{question}"),
+    ])
+
+    # 6. End-to-End Chain
+    rag_chain = (
+        RunnablePassthrough.assign(context=rephrase_chain)
+        | qa_prompt
+        | llm
+        | StrOutputParser()
     )
-    qa_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", system_prompt),
-            MessagesPlaceholder("chat_history"),
-            ("human", "{input}"),
-        ]
-    )
-    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
-
-    # 6. Combined RAG Chain
-    return create_retrieval_chain(history_aware_retriever, question_answer_chain)
+    
+    return rag_chain
 
 
-# --- Document Processing Logic ---
-current_file_names = [f.name for f in uploaded_files] if uploaded_files else []
+# --- Handle Document Ingestion ---
+current_uploaded_names = [f.name for f in uploaded_files] if uploaded_files else []
 
 if uploaded_files and openai_api_key:
-    if st.session_state.processed_files != current_file_names:
-        with st.spinner("Processing documents and generating embeddings..."):
-            st.session_state.rag_chain = initialize_rag(uploaded_files, openai_api_key)
-            st.session_state.processed_files = current_file_names
-            st.success("✅ Documents indexed! You can now start chatting.")
-elif not openai_api_key:
-    st.info("👈 Please enter your OpenAI API key in the sidebar.")
-elif not uploaded_files:
-    st.info("👈 Please upload at least one PDF file in the sidebar.")
+    if st.session_state.indexed_file_names != current_uploaded_names:
+        with st.status("Indexing documents...", expanded=True) as status:
+            st.write("Extracting PDF contents...")
+            st.write("Building vector embeddings with FAISS...")
+            st.session_state.rag_chain = build_rag_pipeline(uploaded_files, openai_api_key)
+            st.session_state.indexed_file_names = current_uploaded_names
+            status.update(label="✅ Indexing Complete! Ready to chat.", state="complete", expanded=False)
 
-# --- Display Chat History ---
+# Empty state notices
+if not openai_api_key:
+    st.info("👈 Please enter your OpenAI API key in the sidebar to get started.")
+elif not uploaded_files:
+    st.info("👈 Please upload one or more PDF files to begin.")
+
+# --- Display Messages ---
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# --- Chat Input & Response Generation ---
-if user_input := st.chat_input("Ask a question about your uploaded documents..."):
+# --- Chat Interaction & Streaming ---
+if user_query := st.chat_input("Ask a question about your files..."):
     if not openai_api_key:
-        st.warning("Please provide your OpenAI API key in the sidebar.")
+        st.warning("Please provide your OpenAI API key.")
     elif st.session_state.rag_chain is None:
-        st.warning("Please upload at least one PDF and ensure it has been indexed.")
+        st.warning("Please upload PDF documents first.")
     else:
-        # Display user question
-        st.session_state.messages.append({"role": "user", "content": user_input})
+        # Display user message
+        st.session_state.messages.append({"role": "user", "content": user_query})
         with st.chat_message("user"):
-            st.markdown(user_input)
+            st.markdown(user_query)
 
-        # Convert Streamlit history to LangChain tuple format
-        chat_history = [
+        # Build message history for LangChain
+        formatted_history = [
             (
                 ("human", m["content"])
                 if m["role"] == "user"
@@ -168,15 +199,18 @@ if user_input := st.chat_input("Ask a question about your uploaded documents..."
             for m in st.session_state.messages[:-1]
         ]
 
-        # Generate LLM response
+        # Display assistant streaming response
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    response = st.session_state.rag_chain.invoke(
-                        {"input": user_input, "chat_history": chat_history}
-                    )
-                    answer = response.get("answer", "No answer generated.")
-                    st.markdown(answer)
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
-                except Exception as e:
-                    st.error(f"An error occurred: {str(e)}")
+            response_container = st.empty()
+            full_response = ""
+            
+            # Stream the generated output directly to UI
+            for chunk in st.session_state.rag_chain.stream(
+                {"question": user_query, "chat_history": formatted_history}
+            ):
+                full_response += chunk
+                response_container.markdown(full_response + "▌")
+            
+            response_container.markdown(full_response)
+        
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
